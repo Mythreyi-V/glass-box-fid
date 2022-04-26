@@ -1,0 +1,1 @@
+{"continuous": ["CRIM", "ZN", "INDUS", "NOX", "RM", "AGE", "DIS", "TAX", "PTRATIO", "B", "LSTAT"], "discrete": ["CHAS_0", "CHAS_1", "RAD_1", "RAD_2", "RAD_3", "RAD_4", "RAD_5", "RAD_6", "RAD_7", "RAD_8", "RAD_24"]}

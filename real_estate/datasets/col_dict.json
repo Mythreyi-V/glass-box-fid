@@ -1,0 +1,1 @@
+{"continuous": ["transaction_date", "house_age", "distance_MRT", "num_conv_stores", "latitude", "longitude"], "discrete": null}
