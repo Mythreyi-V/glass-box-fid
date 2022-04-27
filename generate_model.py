@@ -1,21 +1,10 @@
-#!pip install lime
-#!pip install shap
-#!pip install anchor-exp
-#!pip install hyperopt
-#!pip install imodels
-
 import pandas as pd
 import numpy as np
-
-import xgboost as xgb
-
-import pickle
 
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import classification_report, mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor 
 from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.naive_bayes import GaussianNB
 
 import os
@@ -25,19 +14,6 @@ import joblib
 import warnings
 warnings.filterwarnings('ignore')
 
-import matplotlib.pyplot as plt
-
-from matplotlib.pyplot import figure
-import matplotlib.image as mpimg
-import pylab as pl
-from pylab import savefig
-plt.style.use('seaborn-deep')
-
-import statistics
-import scipy as scp
-import math
-
-import time
 import random
 
 # path to project folder
@@ -70,72 +46,43 @@ feat_list = X_train.columns
 results_template = pd.read_csv(os.path.join(dataset_folder, dataset+"_results_template.csv"), index_col=False)
 
 #Set hyperparameter grid
-if cls_method == "xgboost":
-    space = {'learning_rate': [random.uniform(0,5) for i in range(5)],
-            'subsample': [random.uniform(0.5,1) for i in range(5)],
-            'max_depth': np.arange(1, 33, 6),
-            'colsample_bytree': [random.uniform(0,1) for i in range(5)],
-            'min_child_weight': np.arange(0,6,1)}
-    fit_params = {"eval_set": [(X_train, y_train)]}
-elif cls_method == "decision_tree":
+if cls_method == "decision_tree":
     space = {"splitter": ["best", "random"],
             "min_samples_split": [random.uniform(0, 1) for i in range (50)],
             "max_features": [random.uniform(0,1) for i in range (50)]}
     fit_params = {"sample_weight": None}
+
 elif cls_method == "logit":
     space = {"fit_intercept": [True, False],
              "penalty": ['l1', 'l2', 'elasticnet', 'none'],
              "max_iter": [random.uniform(5,200) for i in range (50)],
              "tol": np.logspace(-4, 4, 50)}
     fit_params = {"sample_weight": None}
-elif cls_method == "brl":
-    space = {"minsupport": [random.uniform(0.1,0.9) for i in range (5)],
-             "max_iter": [random.randint(10000, 50000) for i in range(3)],
-             "maxcardinality": [random.randint(2, 10) for i in range((3))],
-             "n_chains": [random.randint(1,7) for i in range(3)]}
-    fit_params = {"feature_names": feat_list}
+
 elif cls_method == "lin_reg":
     space = {"fit_intercept": [True, False]}
     fit_params = {"sample_weight": None}    
-elif cls_method == "knn":
-    space = {'n_neighbors': [random.randint(1, 15) for i in range(10)],
-             'weights': ['uniform', 'distance'],
-             'leaf_size': [random.randint(1,30) for i in range(10)],
-             'p': [1,2],
-             'algorithm': ['kd_tree', 'ball_tree', 'brute']}
-    fit_params = {}
+
 elif cls_method == "nb":
     space = {'var_smoothing': np.logspace(0, -9, 100)}
     fit_params = {}
 
     
-#Create prediction model
+#Create and train model
 if classification == True:
-    if cls_method == "xgboost":
-        estimator = xgb.XGBClassifier(random_state = random_state)
-    elif cls_method == "decision_tree":
+    if cls_method == "decision_tree":
         space["criterion"] = ["gini", "entropy"]
         estimator = DecisionTreeClassifier(random_state = random_state)
     elif cls_method == "logit":
         estimator = LogisticRegression(random_state = random_state)
-    elif cls_method == "brl":
-        estimator = BayesianRuleListClassifier(random_state = random_state)
-    elif cls_method == "knn":
-        estimator = KNeighborsClassifier()
     elif cls_method == "nb":
         estimator = GaussianNB()
-
-        
 else:
-    if cls_method == "xgboost":
-        estimator = xgb.XGBRegressor(random_state = random_state)
-    elif cls_method == "decision_tree":
+    if cls_method == "decision_tree":
         space["criterion"] = ["mse", "friedman_mse", "mae", "poisson"]
         estimator = DecisionTreeRegressor(random_state = random_state)
     elif cls_method == "lin_reg":
         estimator = LinearRegression()
-    elif cls_method == "knn":
-        estimator = KNeighborsRegressor()
         
 cls = GridSearchCV(estimator, space, verbose = 1)
 cls.fit(X_train.values, y_train, **fit_params)
@@ -143,15 +90,10 @@ cls.fit(X_train.values, y_train, **fit_params)
 cls = cls.best_estimator_
 joblib.dump(cls, save_to+cls_method+"/cls.joblib")
 
-if cls_method == "brl":
-    print(cls)
-
+#Test model accuracy
 test_x = pd.concat([X_test, X_validation])
 test_y = np.hstack([y_test, y_validation])
-if cls_method == "brl":
-    y_pred = cls.predict(test_x.values, threshold = 0.5)
-else:
-    y_pred = cls.predict(test_x.values)
+y_pred = cls.predict(test_x.values)
 
 if classification == True:
     print(classification_report(test_y, y_pred))
@@ -165,7 +107,7 @@ if classification:
     full_test["predicted"] = y_pred
     
     grouped = full_test.groupby('predicted')
-    if grouped.size().min() <= 250:
+    if grouped.size().min() <= 50:
       balanced = grouped.apply(lambda x: x.sample(grouped.size().min()).reset_index(drop=True))
     else:
       balanced = grouped.apply(lambda x: x.sample(250).reset_index(drop=True))
@@ -187,7 +129,7 @@ if classification:
     
 else:
     full_test = pd.concat([test_x.reset_index(), results_template], axis = 1, join = 'inner').drop(['index'], axis = 1)
-    if len(full_test) <= 500:
+    if len(full_test) <= 100:
       sample = full_test
     else:
       sample = full_test.sample(500).reset_index(drop=True)

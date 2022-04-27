@@ -46,11 +46,15 @@ actual = results["Actual"].values
 
 feat_list = [each.replace(' ','_') for each in X_train.columns]
 
+#import underlying model and scaler
 cls = joblib.load(save_to+cls_method+"/cls.joblib")
 scaler = joblib.load(save_to+"/scaler.joblib")
 
+#Get model predictions for all instances
 Y_pred = cls.predict(X_train)
 test_pred = cls.predict(test_x)
+
+#Set up hyperparameter optimisation
 kf = KFold(n_splits=5, shuffle = True, random_state=random_state)
 
 space = {"n_estimators": scope.int(hp.quniform('n_estimators', 1, 20, q=1)),
@@ -107,4 +111,5 @@ else:
     print("MAPE:", mean_absolute_percentage_error(cls.predict(test_x), explainer.predict(test_x)))
     print("R-Squared:", r2_score(cls.predict(test_x), explainer.predict(test_x)))
 
+#save surrogate model
 joblib.dump(explainer, save_to+cls_method+"/acv_explainer_test.joblib")
