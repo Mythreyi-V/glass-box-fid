@@ -1,0 +1,1 @@
+{"SHAP_Percentile": 0.45, "True K": 3.0, "SHAP_K": 2.0, "SHAP_F1": 0.8, "SHAP_Precision": 1.0, "SHAP_Recall": 0.6666666666666666, "Data": "facebook", "Model": "lin_reg", "LIME_Percentile": "all", "LIME_K": 3.0, "LIME_F1": 1.0, "LIME_Precision": 1.0, "LIME_Recall": 1.0, "ACV_Percentile": 0.05, "ACV_K": 1.0, "ACV_F1": NaN, "ACV_Precision": 0.0, "ACV_Recall": 0.0}

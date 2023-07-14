@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 
+from sklearn.metrics import f1_score, classification_report, roc_auc_score, r2_score, mean_absolute_percentage_error
+from sklearn.model_selection import KFold
 import sklearn
 
 import os
@@ -16,22 +18,17 @@ import lime
 import lime.lime_tabular
 import shap
 
-from learning import * #LINDA-BN
+from learning import *
 import pyAgrum
 
 from acv_explainers import ACXplainer
 
-
-import seaborn as sns
-
-import random
-
 from tqdm import tqdm
 
 import json
+from collections import Counter
 
-#Get true features for lin_reg and logit
-def get_reg_features(cls):
+def get_reg_features(cls, percentile):
     
     og_coef = cls.coef_
     if len(og_coef.shape) > 1:
@@ -39,33 +36,43 @@ def get_reg_features(cls):
     
     coef = [abs(val) for val in og_coef]
     
-    bins = pd.cut(coef, 4, retbins = True, duplicates = "drop")
-    q1_min = bins[1][-2]
+    min_coef = min(coef)
+    max_coef = max(coef)
     
-    feat_pos = [i for i in range(len(coef)) if coef[i] > q1_min]
+    k = (max_coef-min_coef)*percentile
+    q1_min = max_coef - k
     
-    return feat_pos
+    feat_pos = [i for i in range(len(coef)) if coef[i] >= q1_min]
+    
+    return coef, feat_pos
 
-#Get true features for nb
-def get_nb_features(cls, instance):
+def get_nb_features(cls, instance, percentile):
     pred = cls.predict(instance.reshape(1, -1))
     means = cls.theta_[pred][0]
     std = np.sqrt(cls.var_[pred])[0]
 
+    alt = 1-pred
+    alt_means = cls.theta_[alt][0]
+    alt_std = np.sqrt(cls.var_[alt])[0]
+    
     likelihoods = []
     
     for i in range(len(means)):
-        lkhood = scipy.stats.norm(means[i], std[i]).logpdf(instance[i])
+        lk = scipy.stats.norm(means[i], std[i]).logpdf(instance[i])
+        alt_lk = scipy.stats.norm(alt_means[i], alt_std[i]).logpdf(instance[i])
+        lkhood = abs(lk-alt_lk)
         likelihoods.append(lkhood)
     
-    bins = pd.cut(likelihoods, 4, retbins = True, duplicates = "drop")[1]
-    lim = bins[-2]
+    min_coef = min(likelihoods)
+    max_coef = max(likelihoods)
+    
+    k = (max_coef-min_coef)*percentile
+    q1_min = max_coef - k
+        
+    feat_pos = [i for i in range(len(likelihoods)) if likelihoods[i] >= q1_min]# or likelihoods[i] <= lim_2]
+    
+    return likelihoods, feat_pos
 
-    feat_pos = [i for i in range(len(likelihoods)) if likelihoods[i] >= lim]
-
-    return feat_pos
-
-#Get true features for dt
 def get_tree_features(cls, instance):
     tree = cls.tree_
     lvl = 0
@@ -89,48 +96,72 @@ def get_tree_features(cls, instance):
             
     feat_pos = set(feats)
     
-    return feat_pos
+    score = np.zeros(len(instance))
+    n = len(feats)
+    for i in feats:
+        score[i]+=n
+        n=n-1
+    
+    return score, feat_pos
 
-#Feature extraction from SHAP
-def get_shap_features(explainer, instance, cls, classification, exp_iter, feat_list):
+def get_path_depths(tree, feat_list, cur_depth = 0, lvl = 0, depths = []):
+    
+    left_child = tree.children_left[lvl]
+    right_child = tree.children_right[lvl]
+    
+    if left_child == sklearn.tree._tree.TREE_LEAF:
+        depths.append(cur_depth)
+        
+    else:
+        depths = get_path_depths(tree, feat_list, cur_depth+1, left_child, depths)
+        depths = get_path_depths(tree, feat_list, cur_depth+1, right_child, depths)
+    return depths
+
+def get_shap_features(explainer, instance, cls, classification, exp_iter, feat_list, percentile):
     
     shap_exp = []
+    
     pred = cls.predict(instance.reshape(1, -1))
+    
     for i in range(exp_iter):
         if type(explainer) == shap.explainers._tree.Tree:
             exp = explainer(instance, check_additivity = False).values
         else:
             exp = explainer(instance.reshape(1, -1)).values
-        
+               
         if exp.shape == (1, len(feat_list), 2):
             exp = exp[0]
+            
+        #print(exp.shape)
         
         if exp.shape == (len(feat_list), 2):
             exp = np.array([feat[pred] for feat in exp]).reshape(len(feat_list))
         elif exp.shape == (1, len(feat_list)) or exp.shape == (len(feat_list), 1):
             exp = exp.reshape(len(feat_list))
-                        
+                
         shap_exp.append(exp)
                 
     if np.array(shap_exp).shape != (exp_iter, len(feat_list)):
         raise Exception("Explanation shape is not correct. It is", np.array(shap_exp).shape, "instead of the expected", (exp_iter, len(feat_list)))
-            
+    
     avg_val = np.average(shap_exp, axis = 0)
     abs_val = [abs(val) for val in avg_val]
     
     #Get recall and precision for the average of shap values
-    bins = pd.cut(abs_val, 4, retbins = True, duplicates = "drop")
-    q1_min = bins[1][-2]
+    min_coef = min(abs_val)
+    max_coef = max(abs_val)
+    
+    k = (max_coef-min_coef)*percentile
+    q1_min = max_coef - k
 
     sorted_val = np.copy(abs_val)
     sorted_val.sort()
     
-    shap_features = [i for i in range(len(feat_list)) if abs_val[i] > q1_min]
+    shap_features = set([i for i in range(len(feat_list)) if abs_val[i] > q1_min])
     
-    return shap_features
+    return abs_val, shap_features
 
-#Feature extraction from LIME
-def get_lime_features(explainer, instance, cls, classification, exp_iter, feat_list):
+def get_lime_features(explainer, instance, cls, classification, exp_iter, feat_list, percentile):
     lime_exp = []
     
     for i in range(exp_iter):
@@ -158,24 +189,25 @@ def get_lime_features(explainer, instance, cls, classification, exp_iter, feat_l
                 feat_name = part.replace(' ','')
         n = feat_list.index(feat_name)
         weights[n].append(exp[1])
-
-    #Get average explanation
+    
     weights = np.transpose(weights)
     avg_weight = np.average(np.array(weights), axis = 0)
     abs_weight = [abs(weight) for weight in avg_weight]
     
-    bins = pd.cut(abs_weight, 4, retbins = True, duplicates = "drop")
-    q1_min = bins[1][-2]
+    min_coef = min(abs_weight)
+    max_coef = max(abs_weight)
+    
+    k = (max_coef-min_coef)*percentile
+    q1_min = max_coef - k
     
     sorted_weight = np.copy(abs_weight)
     sorted_weight.sort()
     
-    lime_features = [i for i in range(len(feat_list)) if abs_weight[i] >= q1_min]
+    lime_features = set([i for i in range(len(feat_list)) if abs_weight[i] >= q1_min])
     
-    return lime_features
+    return abs_weight, lime_features
 
-#Feature extraction from LINDA-BN
-def get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list):
+def get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list, percentile):
     label_lst = ["Negative", "Positive"]
     
     feat_pos = []
@@ -185,14 +217,12 @@ def get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list):
         [bn, inference, infoBN] = generate_BN_explanations(instance, label_lst, feat_list, "Result", 
                                                                        None, scaler, cls, save_to+"/"+cls_method+"/", dataset, show_in_notebook = False)
         
-        #Conduct inference and find posterior for predicted class
         ie = pyAgrum.LazyPropagation(bn)
         result_posterior = ie.posterior(bn.idFromName("Result")).topandas()
         result_proba = result_posterior.loc["Result", label_lst[instance['predictions']]]
         row = instance['original_vector']
         #print(row)
 
-        #Find impact on result for based on each feature
         likelihood = [0]*len(feat_list)
 
         for j in range(len(feat_list)):
@@ -224,80 +254,105 @@ def get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list):
             likelihood[j] = abs(proba_change)
 
         lkhoods.append(likelihood)
-
-    #Find average impact   
-    bins = pd.cut(np.mean(lkhoods, axis=0), 4, retbins = True, duplicates = "drop")
-    q1_min = bins[1][-2]
+        
+    min_coef = min( np.mean(lkhoods, axis=0))
+    max_coef = max( np.mean(lkhoods, axis=0))
+    
+    k = (max_coef-min_coef)*percentile
+    q1_min = max_coef - k
 
     #If fixing all features produces the same result for the class,
     #return all features
     if len(set(np.mean(lkhoods, axis=0)))==1:
         feat_pos.extend(range(len(feat_list)))
-       # print(lkhoods)
     else:
         feat_pos.extend(list(np.where(np.mean(lkhoods, axis=0) >= q1_min)[0]))
 
     feat_pos = set(feat_pos)
-    #print(feat_pos)
     
-    return feat_pos
+    return np.mean(lkhoods, axis=0), feat_pos
 
-#Feature extraction from ACV
-def get_acv_features(explainer, instance, cls, X_train, exp_iter):
+def get_acv_features(explainer, instance, cls, X_train, y_train, exp_iter):
     instance = instance.reshape(1, -1)
     y = cls.predict(instance)
-    y_pred = cls.predict(X_train)
+    
+    t=np.var(y_train)
 
-    feat_pos = []
+    feats = []
+    feat_imp = []
 
-    #Get M-SE
     for i in range(exp_iter):
-        sdp_importance, sdp_index, size, sdp = explainer.importance_sdp_rf(instance, y, X_train, y_pred)
-        feat_pos.extend(sdp_index[0, :size[0]])
+        sufficient_expl, sdp_expl, sdp_global = explainer.sufficient_expl_rf(instance, y, X_train, y_train,
+                                                                                 t=t, pi_level=0.8)
+        clean_expl = sufficient_expl.copy()
+        clean_expl = clean_expl[0]
+        clean_expl = [sublist for sublist in clean_expl if sum(n<0 for n in sublist)==0 ]
 
-    #Find unique features in M-SE
-    feat_pos = set(feat_pos)
+        clean_sdp = sdp_expl[0].copy()
+        clean_sdp = [sdp for sdp in clean_sdp if sdp > 0]
+        
+        lximp = explainer.compute_local_sdp(X_train.shape[1], clean_expl)
+        feat_imp.append(lximp)
+        
+        if len(clean_expl)==0 or len(clean_expl[0])==0:            
+            print("No explamation meets pi level")
+        else:
+            lens = [len(i) for i in clean_expl]
+            print(lens)
+            me_loc = [i for i in range(len(lens)) if lens[i]==min(lens)]
+            mse_loc = np.argmax(np.array(clean_sdp)[me_loc])
+            mse = np.array(clean_expl)[me_loc][mse_loc]
+            feats.extend(mse)
 
-    return feat_pos
+    if len(feats)==0:
+        feat_pos = []
+    else:
+        feat_pos = set(feats)
+    
+      
+    feat_imp = np.mean(feat_imp, axis=0)
+    
+    return feat_imp, feat_pos
 
-#Choose explanation feature extraction method
-def get_explanation_features(explainer, instance, cls, scaler, dataset, X_train, classification, exp_iter, xai_method, feat_list):
+def get_explanation_features(explainer, instance, cls, scaler, dataset, 
+                             classification, exp_iter, xai_method, feat_list, X_train, y_train, percentile):
     if xai_method == "SHAP":
-        feat_pos = get_shap_features(explainer, instance, cls, classification, exp_iter, feat_list)
+        exp_score, feat_pos = get_shap_features(explainer, instance, cls, classification, exp_iter, feat_list, percentile)
         
     elif xai_method == "LIME":
-        feat_pos = get_lime_features(explainer, instance, cls, classification, exp_iter, feat_list)
+        exp_score, feat_pos = get_lime_features(explainer, instance, cls, classification, exp_iter, feat_list, percentile)
         
     elif xai_method == "LINDA":
-        feat_pos = get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list)
-    
+        exp_score, feat_pos = get_linda_features(instance, cls, scaler, dataset, exp_iter, feat_list, percentile)
+
     elif xai_method == "ACV":
-        feat_pos = get_acv_features(explainer, instance, cls, X_train, exp_iter)
+        exp_score, feat_pos = get_acv_features(explainer, instance, cls, X_train, y_train, exp_iter)
         
     explanation_features = [feat_list[i] for i in feat_pos]
-    explanation_features = set(explanation_features)
+    #explanation_features = set(explanation_features)
         
-    return explanation_features
+    return exp_score, explanation_features
 
-#Choose true feature extraction method
-def get_true_features(cls, instance, cls_method, X_train, feat_list):
+def get_true_features(cls, instance, cls_method, X_train, feat_list, percentile):
     if cls_method == "decision_tree":
-        feat_pos = get_tree_features(cls, instance)
+        true_score, feat_pos = get_tree_features(cls, instance)
         
     elif cls_method == "logit" or cls_method == "lin_reg":
-        feat_pos = get_reg_features(cls)
+        true_score, feat_pos = get_reg_features(cls, percentile)
         
     elif cls_method == "nb":
-        feat_pos = get_nb_features(cls, instance)
+        true_score, feat_pos = get_nb_features(cls, instance, percentile)
         
     true_features = [feat_list[i] for i in feat_pos]
     true_features = set(true_features)
         
-    return true_features
+    return true_score, true_features
 
 # path to project folder
 # please change to your own
 PATH = os.getcwd()
+
+print(sys.argv)
 
 dataset = sys.argv[1]
 cls_method = sys.argv[2]
@@ -305,7 +360,8 @@ xai_method = sys.argv[3]
 classification = False if sys.argv[4] == "0" else True
 
 random_state = 22
-exp_iter = 10
+exp_iter = 5
+percentile = 0.05
 
 save_to = "%s/%s/" % (PATH, dataset)
 dataset_folder = "%s/datasets/" % (save_to)
@@ -324,11 +380,9 @@ f.close()
 
 feat_list = [each.replace(' ','_') for each in X_train.columns]
 
-#Get model and scaler
 cls = joblib.load(save_to+cls_method+"/cls.joblib")
 scaler = joblib.load(save_to+"/scaler.joblib")
 
-#Generate SHAP explainer object
 if xai_method == "SHAP":
     if cls_method == "xgboost" or cls_method == "decision_tree":
         explainer = shap.Explainer(cls)
@@ -339,8 +393,7 @@ if xai_method == "SHAP":
             raise TypeError("Cannot run naive bayes with regression")
     else:
         explainer = shap.Explainer(cls, X_train)
-
-#Generate LIME explainer object      
+        
 elif xai_method == "LIME":
     if col_dict['discrete'] != None:
         cat_cols = [each.replace(' ','_') for each in col_dict['discrete']]
@@ -358,49 +411,52 @@ elif xai_method == "LIME":
         explainer = lime.lime_tabular.LimeTabularExplainer(X_train.values, feature_names = feat_list, 
                                                            class_names=class_names, discretize_continuous=True, 
                                                            categorical_features = col_inds, mode = "regression")
-
-#Generate dataset dictionary for LINDA            
+                
 elif xai_method == "LINDA":
     test_dict = generate_local_predictions( test_x, results["Actual"].values, cls, scaler, None )
     explainer = None
 
-#retrieve saved ACV surrogate model
 elif xai_method == "ACV":
   explainer = joblib.load(save_to+cls_method+"/acv_explainer.joblib")
 
 compiled_precision = []
 compiled_recall = []
 
-#For each instance in testing sample
+compiled_precision = []
+compiled_recall = []
+compiled_corr = []
+
 for i in tqdm(range(len(test_x))):
     instance = test_x[i]
-
-    #Get true features
-    true_features = get_true_features(cls, instance, cls_method, X_train.values, feat_list)
+    true_score, true_features = get_true_features(cls, instance, cls_method, X_train.values, feat_list, percentile)
     
     if xai_method == "LINDA":
         instance = test_dict[i]
     
-    #Get explanation features
-    explanation_features = get_explanation_features(explainer, instance, cls, scaler, dataset, X_train.values, classification, exp_iter, xai_method, 
-                                                    feat_list)
-
-    #Calculate precision and recall using both sets  
+    exp_score, explanation_features = get_explanation_features(explainer, instance, cls, scaler, dataset, classification, exp_iter, xai_method, 
+                                                        feat_list, X_train.values, y_train, percentile)
+        
     if len(explanation_features) == 0:
         recall = 0
         precision = 0
     else:
         recall = len(true_features.intersection(explanation_features))/len(true_features)
         precision = len(true_features.intersection(explanation_features))/len(explanation_features)
+        
+    corr = scipy.stats.kendalltau(true_score, exp_score)[0]
     
     compiled_precision.append(precision)
     compiled_recall.append(recall)
-
-#Update results  
+    compiled_corr.append(corr)
+    
+compiled_corr = np.nan_to_num(compiled_corr)
+    
 results[xai_method+" Precision"] = compiled_precision
 results[xai_method+" Recall"] = compiled_recall
+results[xai_method+" Correlation"] = compiled_corr
 
 results.to_csv(os.path.join(save_to, cls_method, "results.csv"), index = False, sep = ";")
 
-print(np.mean(compiled_precision))
-print(np.mean(compiled_recall))
+print("Average Precision:", np.mean(compiled_precision))
+print("Average Recall:", np.mean(compiled_recall))
+print("Average Rank Correlation:", np.mean(compiled_corr))
